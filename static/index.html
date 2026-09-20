@@ -50,15 +50,30 @@
     <section class="result">
       <div class="totals" id="totals"></div>
 
+      <!-- 立柱失效推演 -->
+      <section class="panel sim-panel" id="simPanel">
+        <div class="sim-head">
+          <h2>🧪 立柱失效推演 <span id="simStatus" class="sim-status"></span></h2>
+          <div class="sim-actions">
+            <span class="sim-hint">在下方勾选一根或多根<b>非悬空立柱</b>设为失效柱：整架立即按失效后重新分摊。
+              推演仅基于当前编辑数据，<b>不改写、不自动保存</b>失效标记；清空选择立即恢复基准。</span>
+            <button id="btnSimClear" class="btn btn-ghost btn-sm" type="button" disabled>✕ 清空选择，恢复基准</button>
+          </div>
+        </div>
+        <div id="simSelectors" class="sim-selectors"></div>
+        <div id="simCompare" class="sim-compare" hidden></div>
+      </section>
+
       <div class="views">
         <div class="view-box">
           <div class="view-head">
-            <h2>俯视图（XY 平面，叠加全部层）</h2>
+            <h2>俯视图（XY 平面，叠加全部层）<span id="topViewTag" class="view-tag" hidden>推演结果</span></h2>
             <div class="legend">
               <span><i class="dot normal"></i>正常立柱</span>
               <span><i class="dot overload"></i>超载</span>
               <span><i class="dot overlap"></i>落点重叠</span>
               <span><i class="dot hanging"></i>悬空</span>
+              <span id="legendFailed" hidden><i class="dot failed"></i>失效柱（推演）</span>
             </div>
           </div>
           <canvas id="topView"></canvas>
@@ -66,7 +81,7 @@
 
         <div class="view-box">
           <div class="view-head">
-            <h2>侧视图（分层高度）</h2>
+            <h2>侧视图（分层高度）<span id="sideViewTag" class="view-tag" hidden>推演结果</span></h2>
             <div class="seg">
               <button class="seg-btn active" data-axis="x" type="button">X–Z 立面</button>
               <button class="seg-btn" data-axis="y" type="button">Y–Z 立面</button>
@@ -78,11 +93,11 @@
 
       <div class="bottom-grid">
         <div class="panel issues-panel">
-          <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>
+          <h2>告警与判定 <span id="issueCount" class="badge"></span><span id="issueModeTag" class="view-tag" hidden>基准（推演新增项见上方）</span></h2>
           <ul id="issueList"></ul>
         </div>
         <div class="panel detail-panel">
-          <h2 id="detailTitle">载荷来源明细</h2>
+          <h2 id="detailTitle">载荷来源明细 <span id="detailModeTag" class="view-tag" hidden></span></h2>
           <div id="detailBody"><p class="muted">点击俯视图/侧视图中的立柱或棚板，查看其载荷来源链。</p></div>
         </div>
       </div>

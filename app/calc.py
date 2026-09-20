@@ -20,6 +20,12 @@
   overlap  落点重叠：同层两根及以上立柱底端坐标距离 <= TOL_MM，即踩在同一落点；
                      重叠点对下层棚板的点载荷为各立柱载荷之和；
   overload 超载：立柱实际分配载荷 > 其容量 capacity。
+
+立柱失效推演（calculate 的 failed 参数 / simulate 函数）：
+  在*不改动架体输入*的前提下，把指定立柱临时视为“失效、不承载”，其地位与
+  悬空柱相同（载荷为 0、不参与均摊、不向下传点载荷），但结果中以
+  failed=True 单独标记，与 hanging 悬空柱区分；整架按同一套自上而下规则
+  重新分摊。失效标记不进入架体输入，也不参与持久化。
 """
 
 from __future__ import annotations
@@ -144,12 +150,21 @@ def _overlap_groups(points: List[Dict[str, Any]]) -> List[List[int]]:
 # --------------------------------------------------------------------------
 # 主计算
 # --------------------------------------------------------------------------
-def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """自顶层向下逐层分摊、累加载荷，返回完整结果（供前端渲染与持久化）。"""
+def calculate(
+    raw_state: Optional[Dict[str, Any]],
+    failed: Optional[set] = None,
+) -> Dict[str, Any]:
+    """自顶层向下逐层分摊、累加载荷，返回完整结果（供前端渲染与持久化）。
+
+    failed 为立柱失效推演集合：元素是 (层序(自下而上), 该层立柱录入序号)
+    二元组。被标记的立柱按“失效、不承载”处理（同悬空，但 failed=True
+    单独标记，与几何悬空区分）。该参数不影响架体输入。
+    """
     state = normalize(raw_state)
     car = state["car"]
     layers = state["layers"]
     n = len(layers)
+    failed = failed or set()
 
     car_rect = {"x": 0.0, "y": 0.0, "w": car["w"], "d": car["d"]}
     issues: List[Dict[str, Any]] = []
@@ -162,6 +177,7 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     total_own = 0.0
     total_lost = 0.0
+    total_failed = 0
 
     for i in range(n - 1, -1, -1):
         layer = layers[i]
@@ -189,8 +205,10 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
         posts_out: List[Dict[str, Any]] = []
         supported_idx: List[int] = []
-        for p in layer["posts"]:
+        fail_n = 0
+        for pidx, p in enumerate(layer["posts"]):
             hanging = not in_rect(p["x"], p["y"], support_rect)
+            is_failed = (i, pidx) in failed
             po = {
                 "id": p["id"],
                 "x": r2(p["x"]),
@@ -198,15 +216,30 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "capacity": r2(p["capacity"]),
                 "load": 0.0,
                 "hanging": hanging,
+                "failed": is_failed,
                 "overlap": False,
                 "overloaded": False,
                 "overlapWith": [],
                 "sources": [],
             }
             posts_out.append(po)
-            if not hanging:
+            if is_failed:
+                fail_n += 1
+                issues.append(
+                    {
+                        "level": "warn",
+                        "type": "failed",
+                        "layer": i,
+                        "post": p["id"],
+                        "message": (
+                            f"[推演] {name} 立柱 {p['id']}（{r2(p['x'])}, {r2(p['y'])}）"
+                            f"被设定为失效柱，不承载，载荷改由其余有效柱承担"
+                        ),
+                    }
+                )
+            if not hanging and not is_failed:
                 supported_idx.append(len(posts_out) - 1)
-            else:
+            elif hanging:
                 issues.append(
                     {
                         "level": "error",
@@ -226,16 +259,30 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if unsupported and layer["posts"]:
             lost = board_total
             total_lost += lost
+            fail_ids = [p["id"] for p in posts_out if p["failed"]]
+            if fail_n == len(layer["posts"]):
+                msg = (
+                    f"[推演] {name}全部 {len(layer['posts'])} 根立柱均被设定为失效，"
+                    f"棚板载荷 {r2(board_total)} kg 无有效支撑、无法下传"
+                )
+            elif fail_ids:
+                msg = (
+                    f"{name}其余 {len(layer['posts'])} 根立柱悬空或失效"
+                    f"（失效：{'、'.join(fail_ids)}），"
+                    f"棚板载荷 {r2(board_total)} kg 无有效支撑、无法下传"
+                )
+            else:
+                msg = (
+                    f"{name}全部 {len(layer['posts'])} 根立柱均悬空，"
+                    f"棚板载荷 {r2(board_total)} kg 无有效支撑、无法下传"
+                )
             issues.append(
                 {
                     "level": "error",
                     "type": "unsupported",
                     "layer": i,
                     "post": None,
-                    "message": (
-                        f"{name}全部 {len(layer['posts'])} 根立柱均悬空，"
-                        f"棚板载荷 {r2(board_total)} kg 无有效支撑、无法下传"
-                    ),
+                    "message": msg,
                 }
             )
         elif unsupported:
@@ -351,6 +398,7 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 )
 
         carried = r2(sum(po["load"] for po in posts_out))
+        total_failed += fail_n
         result_layers.append(
             {
                 "index": i,
@@ -374,7 +422,8 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "loadCarried": carried,
                 "lostLoad": r2(lost),
                 "supportedCount": c,
-                "hangingCount": len(layer["posts"]) - c,
+                "hangingCount": sum(1 for po in posts_out if po["hanging"]),
+                "failedCount": fail_n,
                 "posts": posts_out,
             }
         )
@@ -405,7 +454,7 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 }
             )
 
-    order = {"overload": 0, "hang": 1, "unsupported": 2, "overlap": 3, "invalid": 4}
+    order = {"overload": 0, "hang": 1, "unsupported": 2, "overlap": 3, "failed": 4, "invalid": 5}
     issues.sort(key=lambda e: (order.get(e["type"], 9), e["layer"], str(e["post"])))
 
     bottom_carried = (
@@ -421,6 +470,7 @@ def calculate(raw_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "lostLoad": r2(total_lost),
             "postCount": sum(len(l["posts"]) for l in result_layers),
             "layerCount": n,
+            "failedCount": total_failed,
         },
         "toleranceMm": TOL_MM,
     }
@@ -464,3 +514,138 @@ def _prop_items(
                 {"chain": f"{it['chain']} → {label}", "amount": it["amount"] / c}
             )
     return items
+
+
+# --------------------------------------------------------------------------
+# 立柱失效推演
+# --------------------------------------------------------------------------
+def normalize_failed(
+    raw_state: Optional[Dict[str, Any]],
+    failed_sel: Optional[List[Dict[str, Any]]],
+) -> set:
+    """把前端勾选的失效柱（{"layer": 层序, "index": 该层立柱序号}）规范化为
+    (层序, 立柱序号) 集合。悬空柱不允许作为失效柱，直接剔除。
+    """
+    if not failed_sel:
+        return set()
+    state = normalize(raw_state)
+    layers = state["layers"]
+    car_rect = {"x": 0.0, "y": 0.0, "w": state["car"]["w"], "d": state["car"]["d"]}
+    out: set = set()
+    for sel in failed_sel:
+        try:
+            li = int(sel.get("layer"))
+            pi = int(sel.get("index"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not (0 <= li < len(layers)):
+            continue
+        posts = layers[li]["posts"]
+        if not (0 <= pi < len(posts)):
+            continue
+        p = posts[pi]
+        if li == 0:
+            support_rect = car_rect
+        else:
+            lb = layers[li - 1]["board"]
+            support_rect = {"x": lb["x"], "y": lb["y"], "w": lb["w"], "d": lb["d"]}
+        if in_rect(p["x"], p["y"], support_rect):  # 仅非悬空柱可失效
+            out.add((li, pi))
+    return out
+
+
+def build_comparison(
+    baseline: Dict[str, Any], simulated: Dict[str, Any]
+) -> Dict[str, Any]:
+    """基准结果 vs 推演结果：台面载荷/丢失载荷差值、每柱载荷差值、
+    推演后新增的超载项与新增的无支撑层。"""
+    bt, st = baseline["totals"], simulated["totals"]
+    totals_diff = {
+        "carriedAtBottom": r2(st["carriedAtBottom"] - bt["carriedAtBottom"]),
+        "lostLoad": r2(st["lostLoad"] - bt["lostLoad"]),
+    }
+
+    post_diffs: List[Dict[str, Any]] = []
+    bl_layers = baseline["layers"]
+    for li, L in enumerate(simulated["layers"]):
+        bL = bl_layers[li] if li < len(bl_layers) else None
+        for pi, p in enumerate(L["posts"]):
+            bp = bL["posts"][pi] if bL and pi < len(bL["posts"]) else None
+            base_load = bp["load"] if bp else 0.0
+            sim_load = p["load"]
+            post_diffs.append(
+                {
+                    "layer": li,
+                    "layerName": L["name"],
+                    "index": pi,
+                    "post": p["id"],
+                    "x": p["x"],
+                    "y": p["y"],
+                    "baselineLoad": r2(base_load),
+                    "simulatedLoad": r2(sim_load),
+                    "diff": r2(sim_load - base_load),
+                    "hanging": p["hanging"],
+                    "failed": p["failed"],
+                    "baselineOverloaded": bool(bp and bp["overloaded"]),
+                    "simulatedOverloaded": bool(p["overloaded"]),
+                }
+            )
+
+    # 新增超载：推演超载而基准不超载（失效柱本身载荷为 0，不会进入）
+    new_overloads = [
+        {
+            "layer": d["layer"],
+            "layerName": d["layerName"],
+            "index": d["index"],
+            "post": d["post"],
+            "baselineLoad": d["baselineLoad"],
+            "simulatedLoad": d["simulatedLoad"],
+        }
+        for d in post_diffs
+        if d["simulatedOverloaded"] and not d["baselineOverloaded"]
+    ]
+
+    # 新增无支撑：基准层尚有有效柱、推演层无有效柱
+    new_unsupported: List[Dict[str, Any]] = []
+    for li, L in enumerate(simulated["layers"]):
+        bL = bl_layers[li] if li < len(bl_layers) else None
+        if bL and bL["supportedCount"] > 0 and L["supportedCount"] == 0:
+            new_unsupported.append(
+                {
+                    "layer": li,
+                    "layerName": L["name"],
+                    "lostLoad": L["lostLoad"],
+                    "failedCount": L["failedCount"],
+                }
+            )
+
+    failed_posts = [
+        {"layer": d["layer"], "layerName": d["layerName"], "index": d["index"],
+         "post": d["post"], "x": d["x"], "y": d["y"]}
+        for d in post_diffs
+        if d["failed"]
+    ]
+
+    return {
+        "failedPosts": failed_posts,
+        "totalsDiff": totals_diff,
+        "postDiffs": post_diffs,
+        "newOverloads": new_overloads,
+        "newUnsupported": new_unsupported,
+    }
+
+
+def simulate(
+    raw_state: Optional[Dict[str, Any]],
+    failed_sel: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """以当前架体输入为基准做立柱失效推演（只读，不改写架体、不落盘）。
+
+    返回 {"baseline", "simulated", "comparison"}：基准重算结果、按失效柱
+    重新分摊后的结果，以及二者对比。
+    """
+    baseline = calculate(raw_state)
+    failed = normalize_failed(raw_state, failed_sel)
+    simulated = calculate(raw_state, failed=failed)
+    comparison = build_comparison(baseline, simulated)
+    return {"baseline": baseline, "simulated": simulated, "comparison": comparison}

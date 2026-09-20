@@ -6,6 +6,7 @@
 GET  /api/state      读取当前架体（输入），首次启动自动载入示例数据
 PUT  /api/state      保存编辑后的架体（JSON body）
 POST /api/recalc     对给定（或当前持久化）架体重算，返回完整结果
+POST /api/simulate   立柱失效推演：{"state","failedPosts"}，只读不落盘
 GET  /api/result     直接返回当前持久化架体的重算结果
 POST /api/reset      恢复内置示例数据
 """
@@ -18,7 +19,7 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate
+from .calc import calculate, simulate
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -83,6 +84,24 @@ def api_recalc():
     payload = request.get_json(force=True, silent=True)
     state = payload if isinstance(payload, dict) else load_state()
     return jsonify(calculate(state))
+
+
+@app.route("/api/simulate", methods=["POST"])
+def api_simulate():
+    """立柱失效推演（只读）：body 为
+    {"state": 架体JSON(可选，缺省用已保存状态), "failedPosts": [{"layer","index"}, ...]}
+    不写回 state.json，失效标记不持久化。
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    raw_state = payload.get("state")
+    if not isinstance(raw_state, dict):
+        raw_state = load_state()
+    failed_posts = payload.get("failedPosts")
+    if not isinstance(failed_posts, list):
+        failed_posts = []
+    return jsonify(simulate(raw_state, failed_posts))
 
 
 @app.route("/api/result", methods=["GET"])
