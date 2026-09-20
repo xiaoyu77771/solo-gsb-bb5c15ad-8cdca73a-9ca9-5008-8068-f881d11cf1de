@@ -59,6 +59,7 @@
               <span><i class="dot overload"></i>超载</span>
               <span><i class="dot overlap"></i>落点重叠</span>
               <span><i class="dot hanging"></i>悬空</span>
+              <span><i class="dot failed"></i>失效（推演）</span>
             </div>
           </div>
           <canvas id="topView"></canvas>
@@ -74,6 +75,20 @@
           </div>
           <canvas id="sideView"></canvas>
         </div>
+      </div>
+
+      <div class="panel sim-panel">
+        <div class="sim-head">
+          <h2>🔮 立柱失效推演 <span id="simStatus" class="badge">未启用</span></h2>
+          <button id="btnClearSim" class="btn btn-ghost" type="button" disabled>✕ 清空选择 · 恢复基准</button>
+        </div>
+        <p class="hint">
+          勾选下方<b>非悬空</b>立柱作为「失效柱」：系统以当前编辑数据为基准，将其视为不承载后按原规则整架重新分摊，
+          并排对比基准与推演结果。失效标记仅本次会话有效，<span class="hl">不会改写或自动保存</span>架体数据；
+          清空选择立即恢复基准。视图中失效柱为粉色 ⊘（原悬空柱仍为紫色 ✕），点击立柱可查看推演后的载荷来源链。
+        </p>
+        <div id="simPicker" class="sim-picker"></div>
+        <div id="simOutput"></div>
       </div>
 
       <div class="bottom-grid">

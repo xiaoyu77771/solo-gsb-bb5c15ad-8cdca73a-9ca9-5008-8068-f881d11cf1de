@@ -11,6 +11,7 @@
   --error: #ef5b6b;
   --hang: #c061e8;
   --overlap: #ff8c42;
+  --failed: #ff5c8a;
 }
 
 * { box-sizing: border-box; }
@@ -145,6 +146,7 @@ input:focus { outline: none; border-color: var(--accent); }
 .dot.overload { background: var(--error); }
 .dot.overlap { background: var(--overlap); }
 .dot.hanging { background: var(--hang); }
+.dot.failed { background: var(--failed); }
 
 canvas {
   width: 100%;
@@ -162,18 +164,20 @@ canvas {
 .seg-btn.active { background: var(--accent); color: #fff; }
 
 .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-#issueList { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
-#issueList li {
+#issueList, #simNewIssues { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+#issueList li, #simNewIssues li {
   padding: 7px 9px; border-radius: 7px; margin-bottom: 5px; font-size: 12px;
   display: flex; gap: 8px; align-items: baseline; cursor: pointer;
   background: var(--panel2);
 }
-#issueList li:hover { outline: 1px solid var(--accent); }
-#issueList li.error { border-left: 3px solid var(--error); }
-#issueList li.warn { border-left: 3px solid var(--warn); }
-#issueList .itype { font-size: 10px; flex: 0 0 44px; }
-#issueList li.error .itype { color: var(--error); }
-#issueList li.warn .itype { color: var(--warn); }
+#issueList li:hover, #simNewIssues li:hover { outline: 1px solid var(--accent); }
+#issueList li.error, #simNewIssues li.error { border-left: 3px solid var(--error); }
+#issueList li.warn, #simNewIssues li.warn { border-left: 3px solid var(--warn); }
+#issueList li.info, #simNewIssues li.info { border-left: 3px solid var(--failed); }
+#issueList .itype, #simNewIssues .itype { font-size: 10px; flex: 0 0 44px; }
+#issueList li.error .itype, #simNewIssues li.error .itype { color: var(--error); }
+#issueList li.warn .itype, #simNewIssues li.warn .itype { color: var(--warn); }
+#issueList li.info .itype, #simNewIssues li.info .itype { color: var(--failed); }
 .badge {
   background: var(--panel2); border: 1px solid var(--line); border-radius: 20px;
   font-size: 10px; padding: 1px 8px; color: var(--muted); margin-left: 4px;
@@ -192,10 +196,52 @@ canvas {
 .pill.bad { color: var(--error); border: 1px solid var(--error); }
 .pill.hang { color: var(--hang); border: 1px solid var(--hang); }
 .pill.ovl { color: var(--overlap); border: 1px solid var(--overlap); }
+.pill.failed { color: var(--failed); border: 1px solid var(--failed); }
 .kvline { font-size: 12px; line-height: 1.9; }
+
+/* ---------- 立柱失效推演 ---------- */
+.sim-panel { border-style: dashed; }
+.sim-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.sim-head h2 { margin: 0; }
+.badge.has-sim { color: var(--failed); border-color: var(--failed); }
+.stat.sim { border-color: var(--failed); }
+.stat.sim .v { color: var(--failed); font-size: 16px; }
+.sim-picker { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 4px; }
+.sim-layer { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.sim-layer-name { font-size: 11px; color: var(--muted); min-width: 110px; flex: 0 0 auto; }
+.sim-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.sim-chip {
+  display: inline-flex; flex-direction: row; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text); padding: 2px 9px; border-radius: 20px;
+  background: #0d1322; border: 1px solid var(--line); cursor: pointer;
+}
+.sim-chip small { color: var(--muted); font-size: 10px; }
+.sim-chip input { margin: 0; accent-color: var(--failed); }
+.sim-chip.checked { border-color: var(--failed); color: var(--failed); }
+.sim-chip.checked small { color: var(--failed); }
+.sim-chip.hanging { opacity: 0.55; cursor: not-allowed; border-style: dashed; }
+.sim-compare { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+.sim-compare .stat .v { font-size: 15px; }
+.delta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.delta.up, td.up { color: var(--warn); }
+.delta.down, td.down { color: var(--normal); }
+.sim-cols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 14px; }
+.diff-table-wrap { max-height: 240px; overflow-y: auto; }
+.diff-table tr.head td {
+  color: var(--muted); font-size: 10px; position: sticky; top: 0;
+  background: var(--panel); z-index: 1;
+}
+.diff-table tr.is-failed td { color: var(--failed); }
+.tag-failed, .tag-hang {
+  font-size: 9px; padding: 0 5px; border-radius: 10px;
+  border: 1px solid; white-space: nowrap;
+}
+.tag-failed { color: var(--failed); border-color: var(--failed); }
+.tag-hang { color: var(--hang); border-color: var(--hang); }
 
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }
   .bottom-grid { grid-template-columns: 1fr; }
+  .sim-cols { grid-template-columns: 1fr; }
 }

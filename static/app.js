@@ -1,5 +1,6 @@
 /* 陶瓷窑车层架载荷追踪台 —— 原生 JS 前端
- * 所有重算均请求后端 /api/recalc；输入变化防抖触发，结果整架同步刷新。
+ * 编辑重算走 PUT /api/state（自动保存）；立柱失效推演走 POST /api/simulate（只算不存）。
+ * 输入变化防抖触发，结果整架同步刷新；后端不可用时用浏览器内同一套算法兜底。
  */
 "use strict";
 
@@ -7,7 +8,11 @@ const TOL_MM = 10;
 const LAYER_COLORS = ["#4f9dff", "#34c08a", "#c08bff", "#f0b03c", "#ef5b6b", "#3fd6d6"];
 
 let state = null;        // 输入架体（可编辑）
-let result = null;       // 后端计算结果
+let result = null;       // 后端计算结果（基准）
+let simulation = null;   // 失效推演结果（非 null 时视图/明细展示推演值）
+let simDiff = null;      // 基准 vs 推演差异（台面载荷/丢失载荷/逐柱差值/新增问题）
+let failedSelection = []; // 失效柱选择 [{layer, post}]，仅会话内有效，不保存
+let simSeq = 0;          // 推演请求序号，丢弃过期响应
 let selection = null;    // {kind:'post'|'board', layer, post?}
 let sideAxis = "x";
 let recalcTimer = null;
@@ -18,6 +23,8 @@ const sideHit = [];      // 侧视图可点击热区
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const r2 = (v) => Math.round(v * 100) / 100;
+const viewResult = () => simulation || result; // 当前展示用结果：推演进行中为推演值，否则为基准
 const debounce = (fn, ms) => (...args) => {
   clearTimeout(recalcTimer);
   recalcTimer = setTimeout(() => fn(...args), ms);
@@ -83,7 +90,65 @@ async function recalcAndRender() {
     result = calculateLocal(payload);
   }
   selection = selection && stillExists(selection) ? selection : null;
+  // 编辑只更新基准；若正在推演，用同一失效选择在新基准上重跑（失效标记不保存）
+  if (failedSelection.length) await refreshSimulation();
+  else { simulation = null; simDiff = null; }
   renderResults();
+  markLayerBadges();
+}
+
+/* ================= 立柱失效推演 =================
+ * 失效柱选择只保存在会话内（failedSelection），绝不写入 state / 持久化；
+ * 基准 = 当前编辑数据，推演 = 失效柱视为不承载后按原规则整架重新分摊。
+ */
+function isFailed(li, pid) {
+  return failedSelection.some((f) => f.layer === li && f.post === pid);
+}
+
+async function toggleFailed(li, pid, on) {
+  if (on) {
+    if (!isFailed(li, pid)) failedSelection.push({ layer: li, post: pid });
+  } else {
+    failedSelection = failedSelection.filter((f) => !(f.layer === li && f.post === pid));
+  }
+  await applySimulation();
+}
+
+async function applySimulation() {
+  if (failedSelection.length) await refreshSimulation();
+  else { simulation = null; simDiff = null; }
+  renderResults();
+  markLayerBadges();
+}
+
+async function refreshSimulation() {
+  const seq = ++simSeq;
+  const payload = { state, failed: failedSelection };
+  let data = null;
+  try {
+    const res = await fetch("/api/simulate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error("simulate failed");
+    data = await res.json();
+  } catch (e) {
+    data = simulateLocal(state, failedSelection); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== simSeq) return; // 已有更新的推演请求，丢弃过期响应
+  simulation = data.simulation;
+  simDiff = data.diff;
+  // 以实际生效的失效柱为准（失效标记只作用于非悬空柱，编辑后可能不再适用）
+  failedSelection = (data.failed || []).map((f) => ({ layer: f.layer, post: f.post }));
+}
+
+function clearSimulation() {
+  failedSelection = [];
+  simulation = null;
+  simDiff = null;
+  simSeq++; // 使进行中的推演请求失效
+  renderResults(); // 立即恢复基准
   markLayerBadges();
 }
 
@@ -256,6 +321,7 @@ $("#btnReset").addEventListener("click", async () => {
   const data = await res.json();
   state = data.state; result = data.result;
   selection = null;
+  failedSelection = []; simulation = null; simDiff = null; simSeq++;
   renderEditor(); renderResults(); markLayerBadges();
   setSaveState("saved", "✓ 已恢复示例 " + new Date().toLocaleTimeString("zh-CN"));
 });
@@ -275,14 +341,17 @@ function renderResults() {
   drawTop();
   drawSide();
   renderDetail();
+  renderSimPanel();
 }
 
 function renderTotals() {
-  const t = result.totals;
-  const issues = result.issues;
+  const res = viewResult();
+  const t = res.totals;
+  const issues = res.issues;
   const errs = issues.filter((x) => x.level === "error").length;
   const warns = issues.filter((x) => x.level === "warn").length;
   $("#totals").innerHTML = `
+    ${simulation ? `<div class="stat sim"><div class="k">失效推演中</div><div class="v">🔮 ${failedSelection.length}<small> 根立柱失效</small></div></div>` : ""}
     <div class="stat"><div class="k">层数</div><div class="v">${t.layerCount}<small> 层</small></div></div>
     <div class="stat"><div class="k">立柱总数</div><div class="v">${t.postCount}<small> 根</small></div></div>
     <div class="stat"><div class="k">架体总自重</div><div class="v">${fmt(t.ownWeight)}<small> kg（板+坯）</small></div></div>
@@ -292,19 +361,20 @@ function renderTotals() {
 }
 
 function renderIssues() {
+  const res = viewResult();
   const ul = $("#issueList");
   const badge = $("#issueCount");
-  badge.textContent = result.issues.length;
-  badge.className = "badge" + (result.issues.some((x) => x.level === "error") ? " has-error" : "");
-  if (!result.issues.length) {
+  badge.textContent = res.issues.length;
+  badge.className = "badge" + (res.issues.some((x) => x.level === "error") ? " has-error" : "");
+  if (!res.issues.length) {
     ul.innerHTML = `<li class="muted" style="cursor:default">✓ 未发现悬空、落点重叠或超载。</li>`;
     return;
   }
   ul.innerHTML = "";
-  result.issues.forEach((iss) => {
+  res.issues.forEach((iss) => {
     const li = document.createElement("li");
     li.className = iss.level;
-    const labelMap = { overload: "超载", hang: "悬空", unsupported: "无支撑", overlap: "落点重叠", invalid: "数据" };
+    const labelMap = { overload: "超载", hang: "悬空", unsupported: "无支撑", overlap: "落点重叠", invalid: "数据", failed: "失效" };
     li.innerHTML = `<span class="itype">${labelMap[iss.type] || iss.type}</span><span>${escapeHtml(iss.message)}</span>`;
     li.addEventListener("click", () => {
       if (iss.post == null) {
@@ -331,6 +401,7 @@ function setupCanvas(canvas) {
 }
 
 function postColor(p) {
+  if (p.failed) return "#ff5c8a";   // 失效（推演）：与悬空紫色区分
   if (p.hanging) return "#c061e8";
   if (p.overloaded) return "#ef5b6b";
   if (p.overlap) return "#ff8c42";
@@ -342,7 +413,7 @@ function isSelected(kind, li, pid) {
 
 /* ================= 俯视图 ================= */
 function topTransform() {
-  const car = result.car;
+  const car = viewResult().car;
   const pad = 46;
   const cw = Math.max(car.w, 1);
   const cd = Math.max(car.d, 1);
@@ -362,12 +433,13 @@ function topTransform() {
 }
 
 function drawTop() {
-  if (!result) return;
+  if (!viewResult()) return;
   const canvas = $("#topView");
   const { ctx, w, h } = setupCanvas(canvas);
   topHit.length = 0;
   const tr = topTransform();
-  const car = result.car;
+  const res = viewResult();
+  const car = res.car;
 
   ctx.clearRect(0, 0, w, h);
 
@@ -382,7 +454,7 @@ function drawTop() {
   ctx.fillText(`${car.name} ${fmt(car.w)}×${fmt(car.d)} mm`, tr.X(0) + 4, tr.Y(0) + 12);
 
   // 棚板（半透明，自下而上绘制，上层覆盖在下层之上）
-  result.layers.forEach((L, li) => {
+  res.layers.forEach((L, li) => {
     const b = L.board;
     const col = LAYER_COLORS[li % LAYER_COLORS.length];
     ctx.fillStyle = col + "26";
@@ -400,7 +472,7 @@ function drawTop() {
   });
 
   // 重叠落点（画虚线圆圈强调）
-  result.layers.forEach((L) => {
+  res.layers.forEach((L) => {
     L.posts.forEach((p) => {
       const cx = tr.X(p.x), cy = tr.Y(p.y);
       if (p.overlap) {
@@ -416,7 +488,7 @@ function drawTop() {
   });
 
   // 立柱
-  result.layers.forEach((L, li) => {
+  res.layers.forEach((L, li) => {
     L.posts.forEach((p) => {
       const cx = tr.X(p.x), cy = tr.Y(p.y);
       const col = postColor(p);
@@ -424,7 +496,7 @@ function drawTop() {
       ctx.beginPath();
       ctx.arc(cx, cy, sel ? 7 : 4.5, 0, Math.PI * 2);
       ctx.fillStyle = col;
-      ctx.globalAlpha = p.hanging ? 0.35 : 1; // 悬空柱半透明
+      ctx.globalAlpha = p.hanging ? 0.35 : p.failed ? 0.6 : 1; // 悬空/失效柱半透明
       ctx.fill();
       ctx.globalAlpha = 1;
       if (p.hanging) {
@@ -434,6 +506,17 @@ function drawTop() {
         ctx.beginPath();
         ctx.moveTo(cx - 6, cy - 6); ctx.lineTo(cx + 6, cy + 6);
         ctx.moveTo(cx + 6, cy - 6); ctx.lineTo(cx - 6, cy + 6);
+        ctx.stroke();
+      }
+      if (p.failed) {
+        // 失效（推演）：粉色 ⊘ 标记，与悬空 ✕ 区分
+        ctx.strokeStyle = "#ff5c8a";
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 6.5, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - 4.5, cy + 4.5); ctx.lineTo(cx + 4.5, cy - 4.5);
         ctx.stroke();
       }
       if (sel) {
@@ -462,10 +545,11 @@ $("#topView").addEventListener("click", (e) => {
 
 /* ================= 侧视图 ================= */
 function sideGeometry() {
-  const car = result.car;
+  const res = viewResult();
+  const car = res.car;
   // 沿观察轴的台面长度
   const axisLen = sideAxis === "x" ? car.w : car.d;
-  let zMax = result.layers.reduce((s, L) => s + L.height, 0);
+  let zMax = res.layers.reduce((s, L) => s + L.height, 0);
   zMax = Math.max(zMax, 1);
   const c = $("#sideView");
   const W = c.clientWidth || 460;
@@ -480,12 +564,13 @@ function sideGeometry() {
 }
 
 function drawSide() {
-  if (!result) return;
+  if (!viewResult()) return;
   const canvas = $("#sideView");
   const { ctx, w, h } = setupCanvas(canvas);
   sideHit.length = 0;
   const g = sideGeometry();
-  const car = result.car;
+  const res = viewResult();
+  const car = res.car;
 
   ctx.clearRect(0, 0, w, h);
 
@@ -504,7 +589,7 @@ function drawSide() {
   const boardRects = [];
   const zPos = [];
   let acc = 0;
-  result.layers.forEach((L, li) => {
+  res.layers.forEach((L, li) => {
     acc += L.height;
     zPos.push(acc);
     const b = L.board;
@@ -514,20 +599,21 @@ function drawSide() {
   });
 
   // 立柱：顶端在本层棚板 zPos[i]，底端落在下层棚板 zPos[i-1]（底层为台面 0）
-  result.layers.forEach((L, li) => {
+  res.layers.forEach((L, li) => {
     const zTop = zPos[li];
     const zBottom = li === 0 ? 0 : zPos[li - 1];
     L.posts.forEach((p) => {
       const v = sideAxis === "x" ? p.x : p.y;
       const col = postColor(p);
       const sel = isSelected("post", li, p.id);
+      const broken = p.hanging || p.failed; // 悬空/失效均不承载：柱身“短一截”
       ctx.strokeStyle = col;
       ctx.lineWidth = sel ? 3 : 1.8;
-      if (p.hanging) ctx.setLineDash([5, 4]);
+      if (broken) ctx.setLineDash([5, 4]);
       ctx.beginPath();
       ctx.moveTo(g.X(v), g.Z(zTop));
-      // 悬空柱底端画不到承托面：在层间 60% 处终止，视觉上表现为“短一截”
-      const zEnd = p.hanging ? zBottom + (zTop - zBottom) * 0.35 : zBottom;
+      // 悬空/失效柱底端画不到承托面：在层间 60% 处终止，视觉上表现为“短一截”
+      const zEnd = broken ? zBottom + (zTop - zBottom) * 0.35 : zBottom;
       ctx.lineTo(g.X(v), g.Z(zEnd));
       ctx.stroke();
       ctx.setLineDash([]);
@@ -543,6 +629,15 @@ function drawSide() {
         ctx.beginPath();
         ctx.moveTo(x0 - 4, y0 - 4); ctx.lineTo(x0 + 4, y0 + 4);
         ctx.moveTo(x0 + 4, y0 - 4); ctx.lineTo(x0 - 4, y0 + 4);
+        ctx.stroke();
+      } else if (p.failed) {
+        // 失效（推演）：空心圆 + 斜杠 ⊘，与悬空 ✕ 区分
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        const x0 = g.X(v), y0 = g.Z(zEnd);
+        ctx.beginPath();
+        ctx.moveTo(x0 - 4, y0 + 4); ctx.lineTo(x0 + 4, y0 - 4);
         ctx.stroke();
       } else {
         ctx.fillStyle = col;
@@ -569,7 +664,7 @@ function drawSide() {
     ctx.moveTo(g.X(v0), g.Z(zz));
     ctx.lineTo(g.X(v1), g.Z(zz));
     ctx.stroke();
-    const L = result.layers[li];
+    const L = res.layers[li];
     ctx.fillStyle = col;
     ctx.font = "10px sans-serif";
     ctx.fillText(`${L.name} 合计 ${fmt(L.loadTotal)} kg`, g.X(v0) + 3, g.Z(zz) - 7);
@@ -584,7 +679,7 @@ function drawSide() {
   ctx.fillStyle = "#8b97ad";
   ctx.lineWidth = 1;
   let zz = 0;
-  result.layers.forEach((L) => {
+  res.layers.forEach((L) => {
     ctx.beginPath();
     ctx.moveTo(g.X(0) - 5, g.Z(zz));
     ctx.lineTo(g.X(0), g.Z(zz));
@@ -651,10 +746,10 @@ function renderDetail() {
   const body = $("#detailBody");
   if (!selection) {
     title.textContent = "载荷来源明细";
-    body.innerHTML = `<p class="muted">点击俯视图/侧视图中的立柱或棚板，查看其载荷来源链。</p>`;
+    body.innerHTML = `<p class="muted">点击俯视图/侧视图中的立柱或棚板，查看其载荷来源链。${simulation ? "当前处于失效推演模式，显示推演后的来源链。" : ""}</p>`;
     return;
   }
-  const L = result.layers[selection.layer];
+  const L = viewResult().layers[selection.layer];
   if (selection.kind === "board") return renderBoardDetail(L);
   const p = L && L.posts.find((x) => x.id === selection.post);
   if (p) renderPostDetail(L, p);
@@ -662,14 +757,22 @@ function renderDetail() {
 
 function statusPills(p) {
   const pills = [];
-  pills.push(p.hanging ? `<span class="pill hang">悬空</span>` : `<span class="pill ok">有效</span>`);
+  if (p.failed) pills.push(`<span class="pill failed">失效 · 推演</span>`);
+  else pills.push(p.hanging ? `<span class="pill hang">悬空</span>` : `<span class="pill ok">有效</span>`);
   if (p.overloaded) pills.push(`<span class="pill bad">超载</span>`);
   if (p.overlap) pills.push(`<span class="pill ovl">与 ${p.overlapWith.join("、")} 落点重叠</span>`);
   return pills.join(" ");
 }
 
+function baseLoadOf(L, p) {
+  // 基准（未推演）中同层同编号立柱的载荷，用于失效柱说明
+  const BL = result && result.layers[L.index];
+  const bp = BL && BL.posts.find((x) => x.id === p.id);
+  return bp ? bp.load : 0;
+}
+
 function renderPostDetail(L, p) {
-  $("#detailTitle").textContent = `${L.name} · 立柱 ${p.id}`;
+  $("#detailTitle").textContent = `${L.name} · 立柱 ${p.id}${simulation ? "（推演）" : ""}`;
   const rows = (p.sources || []).map((s) =>
     `<tr><td>${escapeHtml(s.label)}</td><td>${fmt(s.amount)}</td></tr>`).join("");
   const body = $("#detailBody");
@@ -681,7 +784,9 @@ function renderPostDetail(L, p) {
       ${p.capacity > 0 ? `<span>利用率 <b>${Math.round(p.load / p.capacity * 100)}%</b></span>` : ""}
     </div>
     <div class="detail-head">${statusPills(p)}</div>
-    ${p.hanging
+    ${p.failed
+      ? `<p class="kvline" style="color:#ff5c8a">该柱在推演中被标记为失效，不参与均摊；基准中载荷 ${fmt(baseLoadOf(L, p))} kg 改由本层其余有效柱承担。点击其他立柱可查看推演后的载荷来源链。</p>`
+      : p.hanging
       ? `<p class="kvline" style="color:#c061e8">该柱底端未落在${L.supportName}矩形范围内，不参与均摊；本层载荷由其余有效立柱承担。</p>`
       : `<table class="src-table">
           ${rows}
@@ -691,7 +796,7 @@ function renderPostDetail(L, p) {
 }
 
 function renderBoardDetail(L) {
-  $("#detailTitle").textContent = `${L.name} · 棚板`;
+  $("#detailTitle").textContent = `${L.name} · 棚板${simulation ? "（推演）" : ""}`;
   const postTable = incomingRowsHtml(L);
   $("#detailBody").innerHTML = `
     <div class="detail-head">
@@ -704,7 +809,7 @@ function renderBoardDetail(L) {
       坯件重量：<b>${fmt(L.wareWeight)} kg</b><br>
       上层立柱传来点载荷合计：<b>${fmt(L.loadIncoming)} kg</b><br>
       棚板承受总载荷：<b>${fmt(L.loadTotal)} kg</b><br>
-      有效立柱 ${L.supportedCount} 根 / 悬空 ${L.hangingCount} 根，
+      有效立柱 ${L.supportedCount} 根 / 悬空 ${L.hangingCount} 根${L.failedCount ? ` / 失效 ${L.failedCount} 根` : ""}，
       下传合计 <b>${fmt(L.loadCarried)} kg</b>
       ${L.lostLoad > 0 ? `<br><span style="color:#ef5b6b">无有效支撑，丢失载荷 ${fmt(L.lostLoad)} kg</span>` : ""}
     </p>
@@ -712,12 +817,129 @@ function renderBoardDetail(L) {
 }
 
 function incomingRowsHtml(L) {
-  // 展示本板总载荷分摊到每根立柱的结果明细（悬空柱载荷为 0）
+  // 展示本板总载荷分摊到每根立柱的结果明细（悬空/失效柱载荷为 0）
   const rows = L.posts.map((p) =>
-    `<tr><td>立柱 ${escapeHtml(p.id)} (${fmt(p.x)},${fmt(p.y)}) ${p.hanging ? "—悬空" : ""}</td><td>${fmt(p.load)}</td></tr>`
+    `<tr><td>立柱 ${escapeHtml(p.id)} (${fmt(p.x)},${fmt(p.y)}) ${p.failed ? "—失效·推演" : p.hanging ? "—悬空" : ""}</td><td>${fmt(p.load)}</td></tr>`
   ).join("");
   return `<table class="src-table">${rows}<tr class="sum"><td>下传合计</td><td>${fmt(L.loadCarried)}</td></tr></table>`;
 }
+
+/* ================= 失效推演面板 ================= */
+function renderSimPanel() {
+  renderSimPicker();
+  renderSimOutput();
+}
+
+function renderSimPicker() {
+  const box = $("#simPicker");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!result) return;
+  // 勾选列表基于基准结果：悬空柱本就不承载，不可选为失效柱
+  result.layers.forEach((L, li) => {
+    const row = document.createElement("div");
+    row.className = "sim-layer";
+    const name = document.createElement("span");
+    name.className = "sim-layer-name";
+    name.textContent = L.name;
+    row.appendChild(name);
+    const chips = document.createElement("div");
+    chips.className = "sim-chips";
+    if (!L.posts.length) {
+      chips.innerHTML = `<span class="muted" style="font-size:11px">（无立柱）</span>`;
+    }
+    L.posts.forEach((p) => {
+      const checked = isFailed(li, p.id);
+      const chip = document.createElement("label");
+      chip.className = "sim-chip" + (p.hanging ? " hanging" : "") + (checked ? " checked" : "");
+      chip.title = p.hanging
+        ? "悬空柱本就不承载，无需失效推演"
+        : `基准载荷 ${fmt(p.load)} kg，勾选后视为失效（不承载）`;
+      chip.innerHTML = p.hanging
+        ? `<input type="checkbox" disabled> ${escapeHtml(p.id)} <small>悬空</small>`
+        : `<input type="checkbox" ${checked ? "checked" : ""}> ${escapeHtml(p.id)} <small>${fmt(p.load)}kg</small>`;
+      if (!p.hanging) {
+        chip.querySelector("input").addEventListener("change", (e) => {
+          toggleFailed(li, p.id, e.target.checked);
+        });
+      }
+      chips.appendChild(chip);
+    });
+    row.appendChild(chips);
+    box.appendChild(row);
+  });
+}
+
+function renderSimOutput() {
+  const out = $("#simOutput");
+  const status = $("#simStatus");
+  const btn = $("#btnClearSim");
+  if (!out) return;
+  const active = !!(simulation && simDiff);
+  status.textContent = active ? `推演中 · 失效 ${failedSelection.length} 根` : "未启用";
+  status.className = "badge" + (active ? " has-sim" : "");
+  btn.disabled = !active && !failedSelection.length;
+  if (!active) {
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">当前显示基准结果。勾选失效柱后，此处并排展示基准与推演的台面载荷、丢失载荷及每根立柱载荷差值，并单独列出推演新增的超载 / 无支撑项。</p>`;
+    return;
+  }
+  const d = simDiff;
+  const cmpCard = (label, pair, badWhen) => {
+    const bad = badWhen === "up" ? pair.delta > 0 : pair.delta < 0;
+    return `<div class="stat ${bad ? "danger" : ""}">
+      <div class="k">${label}</div>
+      <div class="v">${fmt(pair.base)} → ${fmt(pair.sim)}<small> kg</small></div>
+      <div class="delta ${pair.delta > 0 ? "up" : pair.delta < 0 ? "down" : ""}">Δ ${pair.delta > 0 ? "+" : ""}${fmt(pair.delta)} kg</div>
+    </div>`;
+  };
+  const labelMap = { overload: "超载", unsupported: "无支撑" };
+  const newIssuesHtml = d.newIssues.length
+    ? d.newIssues.map((iss) =>
+        `<li class="${iss.level}" data-layer="${iss.layer}" data-post="${iss.post == null ? "" : escapeHtml(iss.post)}">
+           <span class="itype">${labelMap[iss.type] || iss.type}</span><span>${escapeHtml(iss.message)}</span>
+         </li>`).join("")
+    : `<li class="muted" style="cursor:default">✓ 推演未新增超载或无支撑项。</li>`;
+  const rows = d.posts.map((p) => `
+    <tr class="${p.failed ? "is-failed" : ""}">
+      <td>${escapeHtml(p.layerName)}</td>
+      <td>${escapeHtml(p.post)}${p.failed ? ' <span class="tag-failed">失效</span>' : p.hanging ? ' <span class="tag-hang">悬空</span>' : ""}</td>
+      <td>${fmt(p.base)}</td>
+      <td>${fmt(p.sim)}</td>
+      <td class="${p.delta > 0 ? "up" : p.delta < 0 ? "down" : ""}">${p.delta > 0 ? "+" : ""}${fmt(p.delta)}</td>
+    </tr>`).join("");
+  out.innerHTML = `
+    <div class="sim-compare">
+      ${cmpCard("传到台面总载荷（基准 → 推演）", d.carriedAtBottom, "down")}
+      ${cmpCard("丢失载荷（基准 → 推演）", d.lostLoad, "up")}
+    </div>
+    <div class="sim-cols">
+      <div>
+        <div class="sub-title">推演新增超载 / 无支撑</div>
+        <ul id="simNewIssues">${newIssuesHtml}</ul>
+      </div>
+      <div>
+        <div class="sub-title">每根立柱载荷差值（基准 → 推演，kg）</div>
+        <div class="diff-table-wrap">
+          <table class="src-table diff-table">
+            <tr class="head"><td>层</td><td>立柱</td><td>基准</td><td>推演</td><td>差值</td></tr>
+            ${rows}
+          </table>
+        </div>
+      </div>
+    </div>`;
+  // 新增问题可点击定位到对应立柱/棚板
+  out.querySelectorAll("#simNewIssues li[data-layer]").forEach((li) => {
+    li.addEventListener("click", () => {
+      const layer = +li.dataset.layer;
+      selection = li.dataset.post
+        ? { kind: "post", layer, post: li.dataset.post }
+        : { kind: "board", layer };
+      renderDetail(); drawTop(); drawSide();
+    });
+  });
+}
+
+$("#btnClearSim").addEventListener("click", clearSimulation);
 
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
@@ -745,7 +967,8 @@ init();
 /* ======================================================================
  * 离线兜底：后端不可用时在浏览器内执行同一套分摊算法（逻辑与 app/calc.py 对齐）
  * ==================================================================== */
-function calculateLocal(raw) {
+function calculateLocal(raw, failed) {
+  const failedSet = new Set((failed || []).map((f) => `${f.layer}|${f.post}`));
   const car = {
     name: (raw.car && raw.car.name) || "窑车台面",
     w: Math.max(0, num(raw.car && raw.car.w)),
@@ -783,17 +1006,24 @@ function calculateLocal(raw) {
 
     const posts = L.posts.map((p) => {
       const hanging = !inRect(p.x, p.y, supportRect);
+      const isFailed = !hanging && failedSet.has(i + "|" + p.id);
       if (hanging) issues.push({ level: "error", type: "hang", layer: i, post: p.id,
         message: `${L.name} 立柱 ${p.id}（${R(p.x)}, ${R(p.y)}）底端悬空，未落在${supportName}范围内，不承载` });
-      return { id: p.id, x: R(p.x), y: R(p.y), capacity: R(p.capacity), load: 0, hanging, overlap: false, overloaded: false, overlapWith: [], sources: [] };
+      else if (isFailed) issues.push({ level: "info", type: "failed", layer: i, post: p.id,
+        message: `${L.name} 立柱 ${p.id} 被标记为失效（推演），按不承载参与整架重新分摊` });
+      return { id: p.id, x: R(p.x), y: R(p.y), capacity: R(p.capacity), load: 0, hanging, failed: isFailed, overlap: false, overloaded: false, overlapWith: [], sources: [] };
     });
-    const supported = posts.filter((p) => !p.hanging);
+    const supported = posts.filter((p) => !p.hanging && !p.failed);
     const unsupported = supported.length === 0;
     let lost = 0;
     if (unsupported && total > 0) {
       lost = total; totalLost += lost;
+      const hangN = posts.filter((p) => p.hanging).length;
+      const failN = posts.filter((p) => p.failed).length;
       issues.push({ level: "error", type: "unsupported", layer: i, post: null,
-        message: `${L.name}没有有效立柱，棚板载荷 ${R(total)} kg 无支撑、无法下传` });
+        message: failN && L.posts.length
+          ? `${L.name}全部 ${L.posts.length} 根立柱均不承载（悬空 ${hangN} 根、失效 ${failN} 根），棚板载荷 ${R(total)} kg 无支撑、无法下传`
+          : `${L.name}没有有效立柱，棚板载荷 ${R(total)} kg 无支撑、无法下传` });
     }
     const c = supported.length;
     if (c > 0) {
@@ -864,11 +1094,14 @@ function calculateLocal(raw) {
       supportRect: { ...supportRect, x: R(supportRect.x), y: R(supportRect.y), w: R(supportRect.w), d: R(supportRect.d) },
       loadOwn: R(bw + ww), loadIncoming: R(loadIn), loadTotal: R(total),
       loadCarried: R(posts.reduce((s, p) => s + p.load, 0)), lostLoad: R(lost),
-      supportedCount: c, hangingCount: L.posts.length - c, posts,
+      supportedCount: c,
+      hangingCount: posts.filter((p) => p.hanging).length,
+      failedCount: posts.filter((p) => p.failed).length,
+      posts,
     });
   }
   outLayers.reverse();
-  const order = { overload: 0, hang: 1, unsupported: 2, overlap: 3, invalid: 4 };
+  const order = { overload: 0, hang: 1, unsupported: 2, failed: 3, overlap: 4, invalid: 5 };
   issues.sort((a, z) =>
     (order[a.type] ?? 9) - (order[z.type] ?? 9)
     || a.layer - z.layer
@@ -880,8 +1113,46 @@ function calculateLocal(raw) {
       carriedAtBottom: outLayers.length ? outLayers[0].loadCarried : 0,
       lostLoad: R(totalLost),
       postCount: outLayers.reduce((s, L) => s + L.posts.length, 0),
+      failedCount: outLayers.reduce((s, L) => s + (L.failedCount || 0), 0),
       layerCount: n,
     },
     toleranceMm: TOL_MM,
+  };
+}
+
+/* 失效推演离线兜底：基准 vs 推演并排对比（与 app/calc.py 的 simulate 对齐） */
+function simulateLocal(raw, failed) {
+  const baseline = calculateLocal(raw);
+  const simulation = calculateLocal(raw, failed);
+  const applied = [];
+  simulation.layers.forEach((L) => L.posts.forEach((p) => {
+    if (p.failed) applied.push({ layer: L.index, layerName: L.name, post: p.id });
+  }));
+  return { baseline, simulation, failed: applied, diff: diffResults(baseline, simulation) };
+}
+
+function diffResults(base, sim) {
+  const key = (e) => `${e.type}|${e.layer}|${e.post}`;
+  const baseKeys = new Set(base.issues.map(key));
+  const newIssues = sim.issues.filter(
+    (e) => (e.type === "overload" || e.type === "unsupported") && !baseKeys.has(key(e))
+  );
+  const basePosts = {};
+  base.layers.forEach((L) => L.posts.forEach((p) => { basePosts[L.index + "|" + p.id] = p; }));
+  const posts = [];
+  sim.layers.forEach((L) => L.posts.forEach((p) => {
+    const b = basePosts[L.index + "|" + p.id] || { load: 0 };
+    posts.push({
+      layer: L.index, layerName: L.name, post: p.id,
+      base: b.load, sim: p.load, delta: r2(p.load - b.load),
+      failed: !!p.failed, hanging: !!p.hanging, overloaded: !!p.overloaded,
+    });
+  }));
+  const pair = (k) => ({ base: base.totals[k], sim: sim.totals[k], delta: r2(sim.totals[k] - base.totals[k]) });
+  return {
+    carriedAtBottom: pair("carriedAtBottom"),
+    lostLoad: pair("lostLoad"),
+    posts,
+    newIssues,
   };
 }
